@@ -9,8 +9,8 @@
 # Configuration constants
 readonly DEFAULT_CERT_VALIDITY_DURATION_DAYS=3650 # 10 years
 readonly DEFAULT_CRL_VALIDITY_DURATION_DAYS=5475  # 15 years
-readonly EASYRSA_VERSION="3.2.5"
-readonly EASYRSA_SHA256="662ee3b453155aeb1dff7096ec052cd83176c460cfa82ac130ef8568ec4df490"
+readonly EASYRSA_VERSION="3.2.6"
+readonly EASYRSA_SHA256="c2572990ce91112eef8d1b8e4a3b58790da95b68501785c621f69121dfbd22d7"
 
 # =============================================================================
 # Logging Configuration
@@ -22,25 +22,26 @@ VERBOSE=${VERBOSE:-0}
 LOG_FILE=${LOG_FILE:-openvpn-install.log}
 OUTPUT_FORMAT=${OUTPUT_FORMAT:-table} # table or json - json suppresses log output
 
-# Color definitions (disabled if not a terminal, unless FORCE_COLOR=1)
+# Color definitions (disabled if not a terminal, unless FORCE_COLOR=1).
+# Keep these mutable so --no-color can disable colors after startup.
 if [[ -t 1 ]] || [[ $FORCE_COLOR == "1" ]]; then
-	readonly COLOR_RESET='\033[0m'
-	readonly COLOR_RED='\033[0;31m'
-	readonly COLOR_GREEN='\033[0;32m'
-	readonly COLOR_YELLOW='\033[0;33m'
-	readonly COLOR_BLUE='\033[0;34m'
-	readonly COLOR_CYAN='\033[0;36m'
-	readonly COLOR_DIM='\033[0;90m'
-	readonly COLOR_BOLD='\033[1m'
+	COLOR_RESET='\033[0m'
+	COLOR_RED='\033[0;31m'
+	COLOR_GREEN='\033[0;32m'
+	COLOR_YELLOW='\033[0;33m'
+	COLOR_BLUE='\033[0;34m'
+	COLOR_CYAN='\033[0;36m'
+	COLOR_DIM='\033[0;90m'
+	COLOR_BOLD='\033[1m'
 else
-	readonly COLOR_RESET=''
-	readonly COLOR_RED=''
-	readonly COLOR_GREEN=''
-	readonly COLOR_YELLOW=''
-	readonly COLOR_BLUE=''
-	readonly COLOR_CYAN=''
-	readonly COLOR_DIM=''
-	readonly COLOR_BOLD=''
+	COLOR_RESET=''
+	COLOR_RED=''
+	COLOR_GREEN=''
+	COLOR_YELLOW=''
+	COLOR_BLUE=''
+	COLOR_CYAN=''
+	COLOR_DIM=''
+	COLOR_BOLD=''
 fi
 
 # Write to log file (no colors, with timestamp)
@@ -2876,17 +2877,20 @@ function installOpenVPN() {
 
 	# Install the latest version of easy-rsa from source, if not already installed.
 	if [[ ! -d /etc/openvpn/server/easy-rsa/ ]]; then
-		run_cmd_fatal "Downloading Easy-RSA v${EASYRSA_VERSION}" curl -fL --retry 5 -o ~/easy-rsa.tgz "https://github.com/OpenVPN/easy-rsa/releases/download/v${EASYRSA_VERSION}/EasyRSA-${EASYRSA_VERSION}.tgz"
+		local easy_rsa_archive
+		easy_rsa_archive=$(mktemp /tmp/easy-rsa.XXXXXX.tgz) || log_fatal "Failed to create temporary Easy-RSA archive"
+
+		run_cmd_fatal "Downloading Easy-RSA v${EASYRSA_VERSION}" curl -fL --retry 5 -o "$easy_rsa_archive" "https://github.com/OpenVPN/easy-rsa/releases/download/v${EASYRSA_VERSION}/EasyRSA-${EASYRSA_VERSION}.tgz"
 		log_info "Verifying Easy-RSA checksum..."
-		CHECKSUM_OUTPUT=$(echo "${EASYRSA_SHA256}  $HOME/easy-rsa.tgz" | sha256sum -c 2>&1) || {
+		CHECKSUM_OUTPUT=$(echo "${EASYRSA_SHA256}  $easy_rsa_archive" | sha256sum -c 2>&1) || {
 			_log_to_file "[CHECKSUM] $CHECKSUM_OUTPUT"
-			run_cmd "Cleaning up failed download" rm -f ~/easy-rsa.tgz
+			run_cmd "Cleaning up failed download" rm -f "$easy_rsa_archive"
 			log_fatal "SHA256 checksum verification failed for easy-rsa download!"
 		}
 		_log_to_file "[CHECKSUM] $CHECKSUM_OUTPUT"
 		run_cmd_fatal "Creating Easy-RSA directory" mkdir -p /etc/openvpn/server/easy-rsa
-		run_cmd_fatal "Extracting Easy-RSA" tar xzf ~/easy-rsa.tgz --strip-components=1 --no-same-owner --directory /etc/openvpn/server/easy-rsa
-		run_cmd "Cleaning up archive" rm -f ~/easy-rsa.tgz
+		run_cmd_fatal "Extracting Easy-RSA" tar xzf "$easy_rsa_archive" --strip-components=1 --no-same-owner --directory /etc/openvpn/server/easy-rsa
+		run_cmd "Cleaning up archive" rm -f "$easy_rsa_archive"
 
 		cd /etc/openvpn/server/easy-rsa/ || return
 		case $CERT_TYPE in
@@ -3313,6 +3317,21 @@ verb 3"
 	# Some distros (e.g., openSUSE) don't include this in their service file
 	if ! grep -q "RuntimeDirectory=" /etc/systemd/system/openvpn-server@.service; then
 		run_cmd "Patching service file (RuntimeDirectory)" sed -i '/\[Service\]/a RuntimeDirectory=openvpn-server' /etc/systemd/system/openvpn-server@.service
+	fi
+
+	# AppArmor: Ubuntu 25.04+ ships an enforcing profile for OpenVPN
+	# (/etc/apparmor.d/openvpn) that doesn't allow the management unix socket
+	# in /run/openvpn-server/. Add a local override to permit this.
+	if [[ -f /etc/apparmor.d/openvpn ]]; then
+		log_info "Configuring AppArmor for OpenVPN..."
+		mkdir -p /etc/apparmor.d/local
+		if [[ ! -f /etc/apparmor.d/local/openvpn ]] || ! grep -q "openvpn-server" /etc/apparmor.d/local/openvpn; then
+			{
+				echo "# Allow OpenVPN management socket and status files in openvpn-server directory"
+				echo "/{,var/}run/openvpn-server/** rw,"
+			} >>/etc/apparmor.d/local/openvpn
+		fi
+		run_cmd "Reloading AppArmor profile" apparmor_parser -r /etc/apparmor.d/openvpn
 	fi
 
 	run_cmd "Reloading systemd" systemctl daemon-reload
@@ -4668,6 +4687,14 @@ function removeOpenVPN() {
 		run_cmd "Removing OpenVPN docs" rm -rf /usr/share/doc/openvpn*
 		run_cmd "Removing sysctl config" rm -f /etc/sysctl.d/99-openvpn.conf
 		run_cmd "Removing OpenVPN logs" rm -rf /var/log/openvpn
+
+		# AppArmor local override
+		if [[ -f /etc/apparmor.d/local/openvpn ]]; then
+			run_cmd "Removing AppArmor local override" rm -f /etc/apparmor.d/local/openvpn
+			if [[ -f /etc/apparmor.d/openvpn ]]; then
+				run_cmd "Reloading AppArmor profile" apparmor_parser -r /etc/apparmor.d/openvpn 2>/dev/null || true
+			fi
+		fi
 
 		# Unbound
 		if [[ -e /etc/unbound/unbound.conf.d/openvpn.conf ]]; then
